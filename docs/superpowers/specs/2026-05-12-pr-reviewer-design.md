@@ -1,6 +1,7 @@
 # AI-Powered PR Reviewer with Codebase Context — Design Spec
 
 **Date:** 2026-05-12
+**Updated:** 2026-05-13
 **Status:** Approved
 
 ---
@@ -15,46 +16,84 @@ A GitHub bot that automatically reviews Pull Requests using RAG (Retrieval-Augme
 
 ## Architecture
 
-Single Python monorepo, Option A: one FastAPI app + Celery workers sharing the same codebase. No microservices split at launch; internal module boundaries are clean enough to extract later.
+Single Python monorepo: one FastAPI app + Celery workers sharing the same codebase. All AI logic lives in `pipeline/` as pure Python — validated independently before any infrastructure. Celery tasks in `indexer/tasks.py` import `pipeline/` functions directly via `asyncio.run()`.
 
 ```
-rag_pr_reviewer/
-├── api/
-│   ├── main.py              # FastAPI app, lifespan, router registration
+rag-pr-reviewer/
+├── pipeline/                        # Phase 1 — pure Python RAG logic
+│   ├── __init__.py
+│   ├── chunker.py                   # Chunk dataclass + chunk_file() via tree-sitter
+│   ├── embedder.py                  # Embedder.embed() — OpenAI batched calls
+│   ├── qdrant_store.py              # QdrantStore: create, upsert, search, delete_by_filter
+│   ├── retriever.py                 # retrieve() — HyDE + RRF + cross-encoder rerank
+│   └── generator.py                 # generate_review() — GPT-4o JSON → list[ReviewComment]
+├── scripts/                         # Phase 1 — standalone CLI entry points
+│   ├── index_repo.py                # CLI: walk .py files → chunk → embed → upsert
+│   └── review_pipeline.py           # CLI: diff string → retrieve → generate → print JSON
+├── api/                             # Phase 2 — FastAPI app
+│   ├── __init__.py
+│   ├── main.py                      # App init, lifespan (migrations + Qdrant collection init)
+│   ├── dependencies.py              # get_db, get_qdrant
 │   ├── routes/
-│   │   └── webhooks.py      # POST /webhook/github — HMAC-SHA256 verification, routes all events
-│   ├── handlers/
-│   │   ├── indexing.py      # Handles push events → enqueue incremental_index
-│   │   ├── review.py        # Handles pull_request.opened → enqueue review_pr
-│   │   └── feedback.py      # Handles pull_request_review_comment events → feedback loop
-│   └── dependencies.py      # Shared FastAPI deps (DB session, Qdrant client)
-├── indexer/
-│   ├── pipeline.py          # Orchestrates clone → chunk → embed → upsert
-│   ├── chunker.py           # tree-sitter AST chunking (Python; extensible)
-│   ├── embedder.py          # OpenAI text-embedding-3-small wrapper
-│   └── tasks.py             # Celery tasks: full_index, incremental_index
-├── reviewer/
-│   ├── pipeline.py          # Orchestrates retrieval → rerank → generate → post
-│   ├── retriever.py         # Multi-collection Qdrant search + HyDE expansion
-│   ├── reranker.py          # cross-encoder/ms-marco reranking
-│   ├── generator.py         # GPT-4o structured JSON review generation
-│   └── tasks.py             # Celery task: review_pr
-├── github/
-│   ├── auth.py              # JWT + installation token, base64 private key decode
-│   ├── client.py            # PyGitHub wrapper (fetch diff, post review)
-│   └── webhook.py           # HMAC-SHA256 verification, event parsing
-├── db/
-│   ├── models.py            # SQLAlchemy: repos, indexed_files, pr_reviews, review_feedback
-│   └── session.py           # Async engine, session factory
-├── worker.py                # Celery app init, queue config
-├── config.py                # Pydantic Settings (env vars, base64 key decode)
-└── docker-compose.yml       # api, worker, beat, redis, qdrant, postgres
+│   │   ├── __init__.py
+│   │   ├── index.py                 # POST /index — enqueues full_index
+│   │   ├── search.py                # POST /search — calls retriever directly
+│   │   └── webhooks.py              # POST /webhook/github — HMAC verify, routes events
+│   └── handlers/
+│       ├── __init__.py
+│       ├── indexing.py              # handle_push() → enqueue incremental_index
+│       ├── review.py                # handle_pr_opened() → enqueue review_pr
+│       └── feedback.py              # handle_review_comment() → enqueue record_feedback
+├── github/                          # Phase 3 — GitHub App integration
+│   ├── __init__.py
+│   ├── auth.py                      # JWT RS256 mint + installation token cache
+│   ├── events.py                    # HMAC-SHA256 verify + WebhookEvent parsing
+│   └── client.py                    # GithubClient: get_diff(), post_review()
+├── indexer/                         # Phase 2/3 — Celery tasks
+│   ├── __init__.py
+│   └── tasks.py                     # full_index, incremental_index, review_pr, record_feedback
+├── db/                              # Phase 2 — Postgres
+│   ├── __init__.py
+│   ├── models.py                    # Repo, IndexedFile, PRReview, ReviewFeedback
+│   └── session.py                   # Async engine, AsyncSessionLocal
+├── tests/
+│   ├── __init__.py
+│   ├── test_chunker.py
+│   ├── test_embedder.py
+│   ├── test_retriever.py
+│   ├── test_generator.py
+│   ├── test_config.py
+│   ├── test_models.py
+│   ├── test_tasks.py
+│   ├── test_routes.py
+│   ├── test_github_auth.py
+│   ├── test_github_events.py
+│   ├── test_github_client.py
+│   ├── test_webhook_route.py
+│   ├── test_tracing.py
+│   └── test_feedback_score.py
+├── alembic/
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions/
+├── config.py                        # pydantic-settings: all env vars, base64 key decode
+├── worker.py                        # Celery app init
+├── pyproject.toml
+├── alembic.ini
+├── Dockerfile
+├── docker-compose.yml               # dev: api, worker, beat, redis, qdrant, postgres
+├── docker-compose.prod.yml          # prod: no source mounts, restart: always
+├── .env
+└── README.md
 ```
 
 **Module ownership rules:**
-- `api/` never calls `indexer/` or `reviewer/` directly — it enqueues Celery tasks only
-- `reviewer/` accesses GitHub only through `github/client.py`
+- `pipeline/` contains all AI logic — no FastAPI, no Celery, no Postgres imports
+- `api/` never calls `pipeline/` or `indexer/tasks.py` directly — enqueues Celery tasks only
+- `indexer/tasks.py` is the only place that calls `pipeline/` functions (via `asyncio.run()`)
+- `github/` is the only module that talks to the GitHub API
 - `db/` is the only module that writes to Postgres
+- `scripts/` are standalone CLI tools for local dev and Phase 1 validation only
 
 ---
 
@@ -78,6 +117,9 @@ rag_pr_reviewer/
 | repo_id | UUID FK → repos | |
 | file_path | TEXT | Relative path in repo |
 | content_hash | TEXT | SHA256 of file content; NULL = needs retry |
+| status | TEXT | `indexed`, `failed`, `failed_permanent`, `deleted` |
+| retry_count | INT | Incremented on each failure; `failed_permanent` at ≥ 3 |
+| chunk_count | INT | Number of chunks produced on last successful index |
 | indexed_at | TIMESTAMP | |
 | UNIQUE | (repo_id, file_path) | |
 
@@ -87,10 +129,10 @@ rag_pr_reviewer/
 | id | UUID PK | |
 | repo_id | UUID FK → repos | |
 | pr_number | INT | |
-| pr_title | TEXT | |
 | github_review_id | BIGINT | ID returned by GitHub after posting |
-| status | ENUM | `pending`, `posted`, `failed` |
-| raw_llm_output | JSONB | Full structured JSON from GPT-4o |
+| status | TEXT | `pending`, `posted`, `failed` |
+| raw_output | JSONB | Full list of `ReviewComment` dicts from GPT-4o |
+| latency_ms | INT | Wall-clock ms from task start to GitHub post |
 | langfuse_trace_id | TEXT | |
 | created_at | TIMESTAMP | |
 
@@ -100,27 +142,27 @@ rag_pr_reviewer/
 | id | UUID PK | |
 | pr_review_id | UUID FK → pr_reviews | |
 | comment_id | BIGINT | GitHub review comment ID |
-| event | ENUM | `dismissed`, `resolved`, `replied` |
-| langfuse_score | FLOAT | -1.0 (dismissed) to +1.0 (resolved) |
-| recorded_at | TIMESTAMP | |
+| action | TEXT | `dismissed`, `resolved`, `created` |
+| value | FLOAT | -1.0 (dismissed), 0.0 (created), +1.0 (resolved) |
+| timestamp | TIMESTAMP | |
 
 ### Qdrant Collections
 
 All collections use `text-embedding-3-small` (1536 dims), cosine similarity.
 
-**`code_chunks`**
+**`code_chunks`** _(implemented in Phase 1)_
 
 Payload: `repo_id`, `file_path`, `start_line`, `end_line`, `chunk_type` (`function`/`class`/`module`), `content_hash`
 
 Strategy: deleted by `{repo_id, file_path}` filter before re-indexing a changed file.
 
-**`adr_docs`**
+**`adr_docs`** _(out of scope v1)_
 
 Payload: `repo_id`, `file_path`, `section_title`, `doc_type`
 
 Strategy: manually triggered index; ADRs are rarely updated.
 
-**`pr_history`**
+**`pr_history`** _(out of scope v1)_
 
 Payload: `repo_id`, `pr_number`, `comment_body`, `diff_hunk`, `source` (`human`/`bot`), `file_path`, `line`
 
@@ -139,8 +181,8 @@ Strategy: append-only on each closed PR; never deleted.
 1. Fetch file content via GitHub API
 2. `SHA256(content)` → compare against `indexed_files.content_hash`
 3. If hash unchanged → skip
-4. `chunker.py`: tree-sitter parse → extract functions and classes as individual chunks
-   - Fallback: single whole-file chunk if unparseable and file ≤ 8 KB; skip if larger
+4. `pipeline/chunker.py`: tree-sitter parse → extract functions and classes as individual chunks
+   - Fallback: single whole-file chunk if unparseable and file ≤ 2 KB; skip if larger
    - Each chunk captures `start_line`/`end_line` for inline comment positioning
 5. `embedder.py`: batch embed chunks (up to 100 per OpenAI request)
 6. Qdrant: `delete_by_filter({repo_id, file_path})`
@@ -152,54 +194,50 @@ Strategy: append-only on each closed PR; never deleted.
 Same per-file logic, but fetches the full repo tree. Processed in batches of 50 files per Celery task to avoid memory pressure.
 
 **Error handling:**
-- Embedding or Qdrant upsert failure → log file with `content_hash = NULL` → retried on next push
-- Celery task retries 3× with exponential backoff on transient errors
+- Embedding or Qdrant upsert failure → `indexed_files.status = failed`, `content_hash = NULL`, increment `retry_count` → retried on next push
+- At `retry_count >= 3` → `status = failed_permanent`, no further retries
+- Celery task retries 3× with exponential backoff (`30s * 2^attempt`) on transient errors
 
 ---
 
 ## Review Pipeline
 
-**Trigger:** `pull_request.opened` webhook → `review_pr(repo_id, pr_number)` Celery task
+**Trigger:** `pull_request.opened` webhook → `review_pr(repo_full_name, pr_number, installation_id)` Celery task
 
 **Flow:**
 
-1. **Fetch diff** — `github/client.py` fetches PR diff, parsed with `unidiff` → list of `(file_path, hunk, added_lines with line numbers)`
+1. **Fetch diff** — `github/client.py` calls PyGitHub `pr.get_files()`, reconstructs a unified diff string with accurate line numbers
 
-2. **Multi-source retrieval** — for each changed file (up to 10 files by line-change count; the full diff is still fetched, only retrieval is capped to control embedding cost):
-   - HyDE expansion: GPT-4o generates a hypothetical relevant code snippet from the diff hunk, used as the embedding query
-   - Embed the HyDE query with `text-embedding-3-small`
-   - Query all 3 Qdrant collections **in parallel**: `code_chunks` (limit=5), `adr_docs` (limit=3), `pr_history` (limit=3)
-   - Merge + deduplicate results by `content_hash`
+2. **Retrieval** (`pipeline/retriever.py`):
+   - **HyDE expansion**: GPT-4o-mini generates a hypothetical relevant code snippet from the diff; both HyDE and original diff are embedded and averaged into a single query vector
+   - Query `code_chunks` collection (top-20 candidates)
+   - **RRF merge**: `score(doc) = Σ 1/(60 + rank_i)` across ranked lists
+   - **Cross-encoder rerank**: `cross-encoder/ms-marco-MiniLM-L-6-v2` scores top-20 → keep top-5
 
-3. **Reranking** — `cross-encoder/ms-marco` scores all candidates against the original diff hunk text → keep top 8 per file
-
-4. **Generation** — build prompt with diff + retrieved context chunks (with citations: `file_path`, lines, source collection)
-   - GPT-4o with `response_format: json_object` returns:
+3. **Generation** (`pipeline/generator.py`) — GPT-4o with `response_format: json_object`:
    ```json
-   {
-     "summary": "Overall review summary...",
-     "comments": [
-       {
-         "path": "src/auth.py",
-         "line": 42,
-         "side": "RIGHT",
-         "body": "Comment body with reasoning...",
-         "severity": "error|warning|suggestion",
-         "citations": ["code_chunks:src/utils.py:10-25", "adr_docs:ADR-003"]
-       }
-     ]
-   }
+   [
+     {
+       "line": 42,
+       "path": "src/auth.py",
+       "severity": "error|warning|suggestion",
+       "issue": "Describe the problem...",
+       "suggestion": "Describe the fix...",
+       "citation": "pipeline/chunker.py:10-25"
+     }
+   ]
    ```
+   Comments are filtered to lines present in the diff before posting.
 
-5. **Post review** — `github/client.py` submits a single GitHub PR review via `POST /repos/{owner}/{repo}/pulls/{pr}/reviews` containing all inline comments and the summary body
+4. **Post review** — `github/client.py` submits a single GitHub PR review with all inline comments and a summary body
 
-6. **Persist** — insert `pr_reviews` row with `status=posted`, `raw_llm_output`, `langfuse_trace_id`
+5. **Persist** — insert `pr_reviews` row with `status=posted`, `raw_output`, `latency_ms`, `langfuse_trace_id`
 
-7. **Trace close** — Langfuse trace closes with retrieval span and LLM span
+6. **Trace close** — Langfuse trace closes with `retrieval`, `reranking`, `generation`, `post_comment` spans
 
 **Error handling:**
-- GitHub posting failure → `pr_reviews.status = failed`; raw LLM output preserved for manual retry
-- Malformed JSON from GPT-4o → retry generation once with stricter system prompt; if still malformed, fail task and log
+- GitHub posting failure → `pr_reviews.status = failed`; raw output preserved for manual retry
+- Celery task retries 3× with exponential backoff (`30s * 2^attempt`) on any transient error
 
 ---
 
@@ -228,33 +266,39 @@ Same per-file logic, but fetches the full repo tree. Processed in batches of 50 
 3. Exchange JWT for an installation access token (1-hour expiry) via `POST /app/installations/{id}/access_tokens`
 4. All GitHub API calls use the installation token
 
-**Webhook security:** `github/webhook.py` validates `X-Hub-Signature-256` header against `GITHUB_WEBHOOK_SECRET` using `hmac.compare_digest` before any processing.
+**Webhook security:** `github/events.py` validates `X-Hub-Signature-256` header against `GITHUB_WEBHOOK_SECRET` using `hmac.compare_digest` before any processing. All events share a single `POST /webhook/github` endpoint.
 
 **Events handled:**
-- `push` → enqueue `incremental_index`
-- `pull_request.opened` → enqueue `review_pr`
-- `pull_request_review_comment.dismissed` / `.created` → feedback endpoint
+| Event | Handler | Celery task |
+|-------|---------|-------------|
+| `push` | `api/handlers/indexing.py` | `incremental_index(repo_full_name, installation_id, changed_files)` |
+| `pull_request.opened` | `api/handlers/review.py` | `review_pr(repo_full_name, pr_number, installation_id)` |
+| `pull_request_review_comment.dismissed` / `.created` | `api/handlers/feedback.py` | `record_feedback(comment_id, action, raw)` |
 
 ---
 
 ## Observability
 
-**Langfuse — one trace per PR review:**
+**Langfuse — one trace per `review_pr` task:**
 
 | Span | Recorded data |
 |---|---|
-| `retrieval` | query, collection, top-k results, reranker scores, latency |
-| `generation` | prompt tokens, completion tokens, model, latency, structured output |
+| `retrieval` | diff length, number of candidates returned |
+| `reranking` | number of results kept after reranking |
+| `generation` | prompt character count, response character count |
+| `post_comment` | number of comments posted, latency |
 
-Feedback events push a `comment_quality` score to the originating trace, enabling filtering of traces by review quality in the Langfuse dashboard.
+Feedback events (`record_feedback` task) push a `comment_quality` score to the originating trace via `lf.score(trace_id, name="comment_quality", value=±1.0)`.
 
-**Postgres** stores raw `review_feedback` rows for offline analysis (e.g., which file types or severity levels get dismissed most often).
+**Postgres** stores raw `review_feedback` rows for offline analysis (e.g., which severities or file types get dismissed most often).
 
 ---
 
 ## Deployment
 
 ### Local Dev (Docker Compose)
+
+`docker-compose.yml` — source volume mounts, auto-reload:
 
 ```yaml
 services:
@@ -270,9 +314,11 @@ GitHub webhook delivery in dev via `ngrok http 8000`.
 
 ### Production (Railway)
 
+`docker-compose.prod.yml` — no source volume mounts, `restart: always`, reads from `.env.prod`.
+
 - `api` and `worker` as separate Railway services from the same Docker image, different `CMD`
 - Railway managed Postgres and Redis plugins
-- Qdrant as a Railway service with persistent volume (or Qdrant Cloud)
+- Qdrant as a Railway service with persistent volume
 - All secrets injected as Railway environment variables
 
 ### Environment Variables
