@@ -1,4 +1,4 @@
-import importlib
+from openai import AsyncOpenAI
 from config import settings
 
 EMBEDDING_MODEL="text-embedding-3-small"
@@ -6,7 +6,6 @@ BATCH_SIZE=100
 
 class Embedder:
     def __init__(self):
-        AsyncOpenAI = importlib.import_module("openai").AsyncOpenAI
         self.client=AsyncOpenAI(api_key=settings.openai_api_key)
     async def embed(self, texts: list[str]) -> list[list[float]]:
         results: list[list[float]] = []
