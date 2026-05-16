@@ -25,7 +25,7 @@ rag-pr-reviewer/
 │   ├── chunker.py                   # Chunk dataclass + chunk_file() via tree-sitter
 │   ├── embedder.py                  # Embedder.embed() — OpenAI batched calls
 │   ├── qdrant_store.py              # QdrantStore: create, upsert, search, delete_by_filter
-│   ├── retriever.py                 # retrieve() — HyDE + RRF + cross-encoder rerank
+│   ├── retriever.py                 # retrieve() — strip diff markers + RRF + cross-encoder rerank
 │   └── generator.py                 # generate_review() — GPT-4o JSON → list[ReviewComment]
 ├── scripts/                         # Phase 1 — standalone CLI entry points
 │   ├── index_repo.py                # CLI: walk .py files → chunk → embed → upsert
@@ -209,7 +209,7 @@ Same per-file logic, but fetches the full repo tree. Processed in batches of 50 
 1. **Fetch diff** — `github/client.py` calls PyGitHub `pr.get_files()`, reconstructs a unified diff string with accurate line numbers
 
 2. **Retrieval** (`pipeline/retriever.py`):
-   - **HyDE expansion**: GPT-4o-mini generates a hypothetical relevant code snippet from the diff; both HyDE and original diff are embedded and averaged into a single query vector
+   - **Diff marker stripping**: `+`/`-` prefix characters and `@@` hunk headers are removed to produce clean code; both the raw diff and stripped version are embedded in parallel and searched separately
    - Query `code_chunks` collection (top-20 candidates)
    - **RRF merge**: `score(doc) = Σ 1/(60 + rank_i)` across ranked lists
    - **Cross-encoder rerank**: `cross-encoder/ms-marco-MiniLM-L-6-v2` scores top-20 → keep top-5

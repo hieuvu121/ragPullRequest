@@ -20,7 +20,7 @@
 | `pipeline/chunker.py` | `Chunk` dataclass + `chunk_file()` via tree-sitter |
 | `pipeline/embedder.py` | `Embedder.embed()` — OpenAI batched calls |
 | `pipeline/qdrant_store.py` | `QdrantStore`: create collection, upsert, search, delete_by_filter |
-| `pipeline/retriever.py` | `retrieve()` — HyDE + parallel search + RRF + cross-encoder |
+| `pipeline/retriever.py` | `retrieve()` — strip diff markers + parallel search + RRF + cross-encoder |
 | `pipeline/generator.py` | `generate_review()` — GPT-4o JSON, returns `list[ReviewComment]` |
 | `scripts/index_repo.py` | CLI: clone repo → walk `.py` files → chunk → embed → upsert |
 | `scripts/review_pipeline.py` | CLI: raw diff string → retrieve → generate → print JSON |
@@ -742,23 +742,14 @@ async def _embed_one(client: AsyncOpenAI, text: str) -> list[float]:
     return response.data[0].embedding
 
 
-async def _hyde_query(client: AsyncOpenAI, diff_hunk: str) -> str:
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a senior engineer. Given a code diff hunk, write a short "
-                    "Python function (5-10 lines) that represents existing code most "
-                    "relevant to reviewing this change. Output only the code."
-                ),
-            },
-            {"role": "user", "content": diff_hunk},
-        ],
-        max_tokens=200,
-    )
-    return response.choices[0].message.content
+def _strip_diff_markers(diff_hunk: str) -> str:
+    lines = []
+    for line in diff_hunk.splitlines():
+        if line.startswith(("+", "-")):
+            lines.append(line[1:])
+        elif not line.startswith("@@"):
+            lines.append(line)
+    return "\n".join(lines)
 
 
 async def retrieve(
@@ -768,30 +759,27 @@ async def retrieve(
     candidate_pool: int = 20,
 ) -> list[ScoredChunk]:
     client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    stripped = _strip_diff_markers(query)
 
-    # Embed original query and HyDE hypothesis in parallel
-    hyde_text, original_vector = await asyncio.gather(
-        _hyde_query(client, query),
+    # Embed raw diff and stripped code in parallel
+    original_vector, stripped_vector = await asyncio.gather(
         _embed_one(client, query),
+        _embed_one(client, stripped),
     )
-    hyde_vector = await _embed_one(client, hyde_text)
-
-    # Average the two vectors
-    merged_vector = [(o + h) / 2 for o, h in zip(original_vector, hyde_vector)]
 
     # Search with both vectors and merge via RRF
-    original_hits, hyde_hits = await asyncio.gather(
+    original_hits, stripped_hits = await asyncio.gather(
         store.search(original_vector, limit=candidate_pool),
-        store.search(merged_vector, limit=candidate_pool),
+        store.search(stripped_vector, limit=candidate_pool),
     )
 
     id_to_hit: dict[str, SearchHit] = {}
-    for hit in original_hits + hyde_hits:
+    for hit in original_hits + stripped_hits:
         id_to_hit[hit.id] = hit
 
-    original_ids = [h.id for h in original_hits]
-    hyde_ids = [h.id for h in hyde_hits]
-    merged = reciprocal_rank_fusion([original_ids, hyde_ids])
+    merged = reciprocal_rank_fusion(
+        [[h.id for h in original_hits], [h.id for h in stripped_hits]]
+    )
 
     candidates = [
         ScoredChunk(id=doc_id, score=score, payload=id_to_hit[doc_id].payload)
@@ -822,7 +810,7 @@ Expected: 5 `PASSED`
 
 ```bash
 git add pipeline/retriever.py tests/test_retriever.py
-git commit -m "feat: retriever — HyDE expansion, parallel search, RRF, cross-encoder rerank top-5"
+git commit -m "feat: retriever — strip diff markers, parallel search, RRF, cross-encoder rerank top-5"
 ```
 
 ---
@@ -1193,7 +1181,7 @@ Expected: JSON array of comments. Each comment should:
 
 If comments are irrelevant: adjust `SYSTEM_PROMPT` in `generator.py` to be more specific about grounding.
 
-If citations are wrong: check `pipeline/retriever.py` — verify HyDE query is reasonable by printing `hyde_text` temporarily.
+If citations are wrong: check `pipeline/retriever.py` — verify `_strip_diff_markers()` output looks like clean code by printing `stripped` temporarily.
 
 If chunking is wrong: add `print(chunk)` in `index_repo.py` to inspect what's being stored.
 
