@@ -1,13 +1,15 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
-from indexer.tasks import full_index
+form indexer.tasks import full_index
 
 router=APIRouter()
 
-class IndexRequest(BaseModel):
+class IndexerRequest(BaseModel):
+    repo_full_name:str
     installation_id:int
 
 @router.post("/index")
-def post_index(body:IndexRequest):
+def post_index(body: IndexerRequest):
     task=full_index.delay(body.repo_full_name,body.installation_id)
-    return{"task_id":task.id,"status":"queued"}
+    return {"task_id":task.id,"status":"queued"}
+
