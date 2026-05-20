@@ -5,7 +5,6 @@ from openai import AsyncOpenAI
 from sentence_transformers import CrossEncoder
 from dotenv import load_dotenv
 
-from indexer.embedder import EMBEDDING_MODEL
 from pipeline.qdrant_store import QdrantStore, SearchHit
 
 load_dotenv()

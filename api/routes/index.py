@@ -1,6 +1,5 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
-form indexer.tasks import full_index
 
 router=APIRouter()
 
