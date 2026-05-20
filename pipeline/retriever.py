@@ -97,7 +97,7 @@ async def retrieve(
         return candidates
 
     #rerank
-    reranker = _get_reranker()
+    reranker = _get_rerank()
     pairs = [[query, c.payload.get("content", "")] for c in candidates]
     ce_scores = reranker.predict(pairs)
     reranked = sorted(zip(candidates, ce_scores), key=lambda x: x[1], reverse=True)
