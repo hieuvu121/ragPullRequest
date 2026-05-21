@@ -13,12 +13,20 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from datetime import datetime, timezone
 import hashlib
 
-@celery_app.task(name="full_index",bind=True,max_retries=3,default_reetry_delay=60)
+@celery_app.task(name="full_index",bind=True,max_retries=3,default_retry_delay=60)
 def full_index(self,repo_full_name:str, installation_id:int):
     try:
         #create event loop
         asyncio.run(run_full_index(repo_full_name,installation_id))
     except Exception as e:
+        raise self.retry(exc=e,countdown=2**self.request.retries*30)
+
+@celery_app.task(name="incremental_index",bind=True,default_retry_delay=60)
+def incremental_index(self, repo_full_name:str, installation_id:int):
+    try:
+        asyncio.run(run_incremental_index(repo_full_name,installation_id))
+    except Exception as e:
+        #time wait for retry increment
         raise self.retry(exc=e,countdown=2**self.request.retries*30)
 
 #check if hash content changed or not
@@ -101,3 +109,62 @@ async def run_full_index(repo_full_name:str, installation_id:int)->None:
             check=True, capture_output=True,
         )
         await index_directory(Path(tmp),repo_id)
+
+async def run_incremental_index(repo_full_name: str, changed_files: list[dict], installation_id: int) -> None:
+    from github.auth import get_installation_token
+    from github import Github
+    from pipeline.chunker import chunk_file
+    from pipeline.embedder import Embedder
+    import uuid
+    from qdrant_client.models import PointStruct
+
+    store = _make_store()
+    token = get_installation_token(installation_id)
+    g = Github(token)
+    repo = g.get_repo(repo_full_name)
+    repo_id = repo_full_name.replace("/", "-")
+    embedder = Embedder()
+
+    #equal to create db instance and start a session-> async with will auto close session, dont need to close manually
+    async with AsyncSessionLocal() as db:
+        for f in changed_files:
+            path=f["path"]
+            if not path.endswith(".py"):
+                continue
+            if f["status"]=="removed":
+                await store.delete_by_filter(repo_id,path)
+                await marked_deleted(db,repo_full_name,path)
+                continue
+            try:
+                #query content and compare with hash
+                content=repo.get_contents(path).decode_content.decode("utf-8", errors="ignore")
+                new_hash=hashlib.sha256(content.encode()).hexdigest()
+                existing=await get_hash(db,repo_full_name,path)
+
+                if existing==new_hash:
+                    continue
+                #chunk files if new and want to add to dtb
+                chunks=chunk_file(path,content)
+                if not chunks:
+                    continue
+
+                #embed new chunks
+                vectors=await embedder.embed([c.content for c in chunks])
+
+                #delete old chunks
+                await store.delete_by_filter(repo_id,path)
+                points = [
+                    PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=v,
+                        payload={"repo_id": repo_id, "file_path": c.file_path,
+                                 "name": c.name, "chunk_type": c.chunk_type,
+                                 "start_line": c.start_line, "end_line": c.end_line,
+                                 "content": c.content, "content_hash": new_hash},
+                    )
+                    for c, v in zip(chunks, vectors)
+                ]
+                await store.upsert(points)
+                await upsert_indexed_file(db,repo_full_name,path,new_hash,len(chunks))
+            except Exception:
+                await mark_failed(db,repo_full_name,path)
