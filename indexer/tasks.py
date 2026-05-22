@@ -22,7 +22,7 @@ def full_index(self,repo_full_name:str, installation_id:int):
         raise self.retry(exc=e,countdown=2**self.request.retries*30)
 
 @celery_app.task(name="incremental_index",bind=True,default_retry_delay=60)
-def incremental_index(self, repo_full_name:str, installation_id:int):
+def incremental_index(self, repo_full_name:str, changed_files:list[dict], installation_id:int):
     try:
         asyncio.run(run_incremental_index(repo_full_name,installation_id))
     except Exception as e:
@@ -54,8 +54,8 @@ async def upsert_indexed_file(db,repo_full_name:str, file_path:str,content_hash:
     ).on_conflict_do_update(
         #if index elements exist before-> update only
         index_elements=["repo_id","file_path"],
-        set={"content_hash":content_hash, "status":"indexed",
-             "chunk_count":chunk_count,"indexed_at":datetime.now(timezone.utc)}
+        set_={"content_hash":content_hash, "status":"indexed",
+              "chunk_count":chunk_count,"indexed_at":datetime.now(timezone.utc)}
     )
 
     await db.execute(stmt)
@@ -89,7 +89,7 @@ async def marked_deleted(db,repo_full_name:str, file_path:str)->None:
     await db.execute(
         update(IndexedFile)
         .where(IndexedFile.file_path==file_path)
-        .values(status=="deleted",content_hash=None)
+        .values(status="deleted", content_hash=None)
     )
 
     await db.commit()
@@ -118,7 +118,7 @@ async def run_incremental_index(repo_full_name: str, changed_files: list[dict], 
     import uuid
     from qdrant_client.models import PointStruct
 
-    store = _make_store()
+    store = make_store()
     token = get_installation_token(installation_id)
     g = Github(token)
     repo = g.get_repo(repo_full_name)
@@ -137,7 +137,7 @@ async def run_incremental_index(repo_full_name: str, changed_files: list[dict], 
                 continue
             try:
                 #query content and compare with hash
-                content=repo.get_contents(path).decode_content.decode("utf-8", errors="ignore")
+                content=repo.get_contents(path).decoded_content.decode("utf-8", errors="ignore")
                 new_hash=hashlib.sha256(content.encode()).hexdigest()
                 existing=await get_hash(db,repo_full_name,path)
 
@@ -168,3 +168,29 @@ async def run_incremental_index(repo_full_name: str, changed_files: list[dict], 
                 await upsert_indexed_file(db,repo_full_name,path,new_hash,len(chunks))
             except Exception:
                 await mark_failed(db,repo_full_name,path)
+
+async def run_review_pr(repo_full_name:str, pr_number:int, diff_text:str,installation_id:int)-> None:
+    from scripts.review_pipeline import parse_diff_lines
+    import time
+
+    store=make_store()
+    diff_lines=parse_diff_lines(diff_text)
+    t0=time.monotonic()
+    chunks=await retrieve(store=store,query=diff_text,top_k=5)
+    comments=await generate_review(diff_text=diff_text,chunks=chunks,diff_lines=diff_lines)
+    latency_ms=int((time.monotonic()-t0)*1000)
+
+    #insert pr review to
+    async with AsyncSessionLocal() as db:
+        stmt = pg_insert(PRReview).values(
+            pr_number=pr_number,
+            status="posted" if comments else "failed",
+            latency_ms=latency_ms,
+            raw_output={"comments": [
+                {"line": c.line, "path": c.path, "severity": c.severity,
+                 "issue": c.issue, "suggestion": c.suggestion, "citation": c.citation}
+                for c in comments
+            ]},
+        )
+        await db.execute(stmt)
+        await db.commit()
