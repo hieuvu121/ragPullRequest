@@ -12,9 +12,8 @@ VECTOR_DIM = 1536
 #init connection 1 time for the whole controller
 async def init_qdrant(app: FastAPI):
     client=AsyncQdrantClient(url=settings.qdrant_url,api_key=settings.qdrant_api_key or None)
-    existing={c.name for c in (await client.get_collections()).collections}
     for name in QDRANT_COLLECTIONS:
-        if not name in existing:
+        if not await client.collection_exists(name):
             await client.create_collection(
                 collection_name=name,
                 vectors_config=VectorParams(size=VECTOR_DIM,distance=Distance.COSINE)

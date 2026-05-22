@@ -2,7 +2,6 @@ import asyncio
 import os
 from dataclasses import dataclass
 from openai import AsyncOpenAI
-from sentence_transformers import CrossEncoder
 from dotenv import load_dotenv
 
 from pipeline.qdrant_store import QdrantStore, SearchHit
@@ -10,8 +9,6 @@ from pipeline.qdrant_store import QdrantStore, SearchHit
 load_dotenv()
 
 EMBEDDING_MODEL = "text-embedding-3-small"
-RERANKING_MODEL="cross-encoder/ms-marco-MiniLM-L-6-v2"
-_reranker: CrossEncoder | None = None
 
 @dataclass
 #will rerank the result so set the score again
@@ -30,13 +27,6 @@ def reciprocal_rank_fusion(ranked_lists:list[list[str]],k:int=60 )->list[tuple[s
         #return list tuple (doc1,0.2), (doc2,0.3)
         #lambda func take first element(x) to sort
         return sorted(scores.items(),key=lambda x:x[1],reverse=True)
-
-#define lazy load for get rerank
-def _get_rerank()-> CrossEncoder:
-    global _reranker
-    if _reranker is None:
-        _reranker=CrossEncoder(RERANKING_MODEL)
-    return _reranker
 
 async def _embed_one(client: AsyncOpenAI, text: str) -> list[float]:
     response = await client.embeddings.create(model=EMBEDDING_MODEL, input=[text])
@@ -93,12 +83,4 @@ async def retrieve(
         if doc_id in id_to_hit
     ]
 
-    if len(candidates)<=top_k:
-        return candidates
-
-    #rerank
-    reranker = _get_rerank()
-    pairs = [[query, c.payload.get("content", "")] for c in candidates]
-    ce_scores = reranker.predict(pairs)
-    reranked = sorted(zip(candidates, ce_scores), key=lambda x: x[1], reverse=True)
-    return [chunk for chunk, _ in reranked[:top_k]]
+    return candidates[:top_k]

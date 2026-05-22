@@ -25,8 +25,7 @@ class QdrantStore:
         self.client=AsyncQdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))
 
     async def create_collection(self)->None:
-        existing={c.name for c in(await self.client.get_collections())}
-        if COLLECTION not in existing:
+        if not await self.client.collection_exists(COLLECTION):
             await self.client.create_collection(
                 collection_name=COLLECTION,
                 vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE)
@@ -37,16 +36,12 @@ class QdrantStore:
         await self.client.upsert(collection_name=COLLECTION,points=points)
 
     async def search(self,query_vector:list[float],limit:int=20)->list[SearchHit]:
-        hits=await self.client.search(
+        result=await self.client.query_points(
             collection_name=COLLECTION,
-            query_vector=query_vector,
+            query=query_vector,
             limit=limit
         )
-#        SearchHit=[]
- #       for h in hits:
-  #          hit=SearchHit(id=str(h.id),score=h.score,payload=h.payload or{})
-   #         SearchHit.append(hit)
-        return [SearchHit(id=str(h.id),score=h.score,payload=h.payload or{})for h in hits]
+        return [SearchHit(id=str(h.id),score=h.score,payload=h.payload or{})for h in result.points]
 
 #need to pass repo and path id
     async def delete_by_filter(self, repo_id:str, file_path:str)->None:
