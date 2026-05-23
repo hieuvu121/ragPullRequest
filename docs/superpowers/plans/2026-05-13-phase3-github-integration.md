@@ -111,6 +111,13 @@ Expected: prints the app ID integer from `.env`.
 
 ## Task 2: GitHub Auth (`github/auth.py`)
 
+> **Updated approach:** Token caching uses Redis instead of in-memory dict.
+> The original plan cached `_cached_token` as an instance variable on `GitHubAuth`,
+> but `make_auth()` creates a new instance on every call so the cache was never reused.
+> With 4 Celery worker processes, each process had its own memory — no sharing across workers.
+> Redis is already in the stack and shared by all workers, so it is the correct cache layer.
+> TTL is set to 55 minutes (token lasts 1 hour, 5-min safety buffer) and handled natively by Redis.
+
 **Files:**
 - Create: `github/__init__.py`
 - Create: `github/auth.py`
@@ -127,47 +134,51 @@ from github.auth import GitHubAuth
 
 
 @pytest.fixture
-def auth(tmp_path):
+def pem():
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.hazmat.primitives import serialization
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = private_key.private_bytes(
+    return private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.TraditionalOpenSSL,
         encryption_algorithm=serialization.NoEncryption(),
     ).decode()
-    return GitHubAuth(app_id=12345, private_key_pem=pem, installation_id=99)
+
+
+@pytest.fixture
+def auth(pem):
+    fake_redis = MagicMock()
+    fake_redis.get.return_value = None
+    return GitHubAuth(app_id=12345, private_key_pem=pem, installation_id=99, redis_client=fake_redis)
 
 
 def test_jwt_fields(auth):
     import jwt
     token = auth._mint_jwt()
-    # decode without verification to inspect claims
     claims = jwt.decode(token, options={"verify_signature": False})
     assert claims["iss"] == "12345"
-    assert claims["exp"] - claims["iat"] <= 600  # max 10 minutes
+    assert claims["exp"] - claims["iat"] <= 600
 
 
-def test_token_cached(auth):
-    fake_token = {"token": "ghs_abc", "expires_at": "2099-01-01T00:00:00Z"}
-    with patch.object(auth, "_fetch_installation_token", return_value=fake_token) as mock:
-        t1 = auth.get_installation_token()
-        t2 = auth.get_installation_token()
-    mock.assert_called_once()
-    assert t1 == t2 == "ghs_abc"
+def test_token_cached_in_redis(pem):
+    fake_redis = MagicMock()
+    fake_redis.get.return_value = b"ghs_cached"
+    auth = GitHubAuth(app_id=12345, private_key_pem=pem, installation_id=99, redis_client=fake_redis)
+    with patch.object(auth, "_fetch_installation_token") as mock_fetch:
+        token = auth.get_installation_token()
+    mock_fetch.assert_not_called()
+    assert token == "ghs_cached"
 
 
-def test_token_refreshed_before_expiry(auth):
-    import datetime
-    # Set cached token that expires in 4 minutes (within 5-min buffer)
-    soon = (datetime.datetime.utcnow() + datetime.timedelta(minutes=4)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-    auth._cached_token = {"token": "old_token", "expires_at": soon}
-    new_token = {"token": "new_token", "expires_at": "2099-01-01T00:00:00Z"}
-    with patch.object(auth, "_fetch_installation_token", return_value=new_token):
-        result = auth.get_installation_token()
-    assert result == "new_token"
+def test_token_fetched_and_stored_when_cache_miss(pem):
+    fake_redis = MagicMock()
+    fake_redis.get.return_value = None
+    auth = GitHubAuth(app_id=12345, private_key_pem=pem, installation_id=99, redis_client=fake_redis)
+    fake_token = {"token": "ghs_new", "expires_at": "2099-01-01T00:00:00Z"}
+    with patch.object(auth, "_fetch_installation_token", return_value=fake_token):
+        token = auth.get_installation_token()
+    assert token == "ghs_new"
+    fake_redis.setex.assert_called_once_with("github:token:99", 55 * 60, "ghs_new")
 ```
 
 - [ ] **Step 2: Run to confirm failure**
@@ -188,18 +199,19 @@ Expected: `ImportError` — `github.auth` does not exist yet.
 
 ```python
 import time
-import datetime
 import requests
 import jwt
+import redis as redis_lib
 from config import settings
 
 
 class GitHubAuth:
-    def __init__(self, app_id: int, private_key_pem: str, installation_id: int):
+    def __init__(self, app_id: int, private_key_pem: str, installation_id: int,
+                 redis_client=None):
         self.app_id = app_id
         self.private_key_pem = private_key_pem
         self.installation_id = installation_id
-        self._cached_token: dict | None = None
+        self._redis = redis_client
 
     def _mint_jwt(self) -> str:
         now = int(time.time())
@@ -218,25 +230,24 @@ class GitHubAuth:
         resp.raise_for_status()
         return resp.json()
 
-    def _token_expires_soon(self) -> bool:
-        if not self._cached_token:
-            return True
-        expires_at = datetime.datetime.strptime(
-            self._cached_token["expires_at"], "%Y-%m-%dT%H:%M:%SZ"
-        )
-        return (expires_at - datetime.datetime.utcnow()).total_seconds() < 300
-
     def get_installation_token(self) -> str:
-        if self._token_expires_soon():
-            self._cached_token = self._fetch_installation_token()
-        return self._cached_token["token"]
+        cache_key = f"github:token:{self.installation_id}"
+        cached = self._redis.get(cache_key)
+        if cached:
+            return cached.decode() if isinstance(cached, bytes) else cached
+        token_data = self._fetch_installation_token()
+        # 55-minute TTL — token lasts 1 hour, 5-min safety buffer
+        self._redis.setex(cache_key, 55 * 60, token_data["token"])
+        return token_data["token"]
 
 
 def make_auth(installation_id: int) -> GitHubAuth:
+    r = redis_lib.from_url(settings.redis_url)
     return GitHubAuth(
         app_id=settings.github_app_id,
         private_key_pem=settings.github_private_key_pem,
         installation_id=installation_id,
+        redis_client=r,
     )
 ```
 
