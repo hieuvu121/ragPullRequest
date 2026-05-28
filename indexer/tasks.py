@@ -8,7 +8,7 @@ from pipeline.retriever import retrieve
 from pipeline.generator import generate_review
 from scripts.index_repo import index_directory
 from db.session import AsyncSessionLocal
-from db.models import IndexedFile, PRReview
+from db.models import IndexedFile, PRReview, ReviewFeedback, Repo
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from datetime import datetime, timezone
 import hashlib
@@ -111,7 +111,7 @@ async def run_full_index(repo_full_name:str, installation_id:int)->None:
         await index_directory(Path(tmp),repo_id)
 
 async def run_incremental_index(repo_full_name: str, changed_files: list[dict], installation_id: int) -> None:
-    from github.auth import get_installation_token
+    from github.auth import make_auth
     from github import Github
     from pipeline.chunker import chunk_file
     from pipeline.embedder import Embedder
@@ -119,7 +119,7 @@ async def run_incremental_index(repo_full_name: str, changed_files: list[dict], 
     from qdrant_client.models import PointStruct
 
     store = make_store()
-    token = get_installation_token(installation_id)
+    token = make_auth(installation_id).get_installation_token()
     g = Github(token)
     repo = g.get_repo(repo_full_name)
     repo_id = repo_full_name.replace("/", "-")
@@ -169,28 +169,98 @@ async def run_incremental_index(repo_full_name: str, changed_files: list[dict], 
             except Exception:
                 await mark_failed(db,repo_full_name,path)
 
-async def run_review_pr(repo_full_name:str, pr_number:int, diff_text:str,installation_id:int)-> None:
-    from scripts.review_pipeline import parse_diff_lines
+@celery_app.task(name="review_pr", bind=True, max_retries=3)
+def review_pr(self, repo_full_name: str, pr_number: int, installation_id: int):
+    try:
+        asyncio.run(_run_review(repo_full_name, pr_number, installation_id))
+    except Exception as exc:
+        raise self.retry(exc=exc, countdown=2 ** self.request.retries * 30)
+
+
+async def _run_review(repo_full_name: str, pr_number: int, installation_id: int) -> None:
     import time
+    from sqlalchemy import select
+    from github.auth import make_auth
+    from github.client import GithubClient
+    from scripts.review_pipeline import parse_diff_lines
 
-    store=make_store()
-    diff_lines=parse_diff_lines(diff_text)
-    t0=time.monotonic()
-    chunks=await retrieve(store=store,query=diff_text,top_k=5)
-    comments=await generate_review(diff_text=diff_text,chunks=chunks,diff_lines=diff_lines)
-    latency_ms=int((time.monotonic()-t0)*1000)
+    start = time.monotonic()
+    token = make_auth(installation_id).get_installation_token()
+    client = GithubClient(token=token)
+    diff = client.get_diff(repo_full_name, pr_number)
 
-    #insert pr review to
+    store = make_store()
+
     async with AsyncSessionLocal() as db:
-        stmt = pg_insert(PRReview).values(
-            pr_number=pr_number,
-            status="posted" if comments else "failed",
-            latency_ms=latency_ms,
-            raw_output={"comments": [
-                {"line": c.line, "path": c.path, "severity": c.severity,
-                 "issue": c.issue, "suggestion": c.suggestion, "citation": c.citation}
+        result = await db.execute(select(Repo).where(Repo.full_name == repo_full_name))
+        db_repo = result.scalar_one_or_none()
+        if not db_repo:
+            return
+
+        pr_review = PRReview(repo_id=db_repo.id, pr_number=pr_number, status="pending")
+        db.add(pr_review)
+        await db.flush()
+
+        try:
+            diff_lines = parse_diff_lines(diff)
+            chunks = await retrieve(store=store, query=diff, top_k=5)
+            comments = await generate_review(diff_text=diff, chunks=chunks, diff_lines=diff_lines)
+
+            gh_comments = [
+                {
+                    "path": c.path,
+                    "line": c.line,
+                    "side": "RIGHT",
+                    "body": f"**[{c.severity.upper()}]** {c.issue}\n\n{c.suggestion}\n\n> _{c.citation}_",
+                }
                 for c in comments
-            ]},
+            ]
+            summary = f"AI review for PR #{pr_number} — {len(comments)} comment(s) generated."
+            github_review_id = client.post_review(repo_full_name, pr_number, summary, gh_comments)
+
+            pr_review.status = "posted"
+            pr_review.github_review_id = github_review_id
+            pr_review.latency_ms = int((time.monotonic() - start) * 1000)
+            pr_review.raw_output = {
+                "comments": [
+                    {"line": c.line, "path": c.path, "severity": c.severity,
+                     "issue": c.issue, "suggestion": c.suggestion, "citation": c.citation}
+                    for c in comments
+                ]
+            }
+        except Exception:
+            pr_review.status = "failed"
+            raise
+
+        await db.commit()
+
+
+@celery_app.task(name="record_feedback", bind=True, max_retries=3)
+def record_feedback(self, comment_id: int, action: str, raw: dict):
+    try:
+        asyncio.run(_run_feedback(comment_id, action, raw))
+    except Exception as exc:
+        raise self.retry(exc=exc, countdown=2 ** self.request.retries * 30)
+
+async def _run_feedback(comment_id: int, action: str, raw: dict) -> None:
+    from sqlalchemy import select
+
+    score_map = {"resolved": 1.0, "dismissed": -1.0, "created": 0.0}
+    value = score_map.get(action, 0.0)
+    github_review_id = raw.get("pull_request_review_id")
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(PRReview).where(PRReview.github_review_id == github_review_id)
         )
-        await db.execute(stmt)
+        pr_review = result.scalar_one_or_none()
+        if not pr_review:
+            return
+
+        db.add(ReviewFeedback(
+            review_id=pr_review.id,
+            comment_id=comment_id,
+            action=action,
+            value=value,
+        ))
         await db.commit()

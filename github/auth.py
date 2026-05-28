@@ -38,17 +38,17 @@ class GithubAuth:
         resp.raise_for_status()
         return resp.json()
 
-    def _get_installation_token(self)->str:
+    def get_installation_token(self)->str:
         key = f"github:token:{self.installation_id}"
         cached=self.redis_client.get(key)
         if cached:
             return cached.decode() if isinstance(cached, bytes) else cached
-        token=self._fetch_installation_token()
+        token_data=self._fetch_installation_token()
         self.redis_client.setex(key,55*60,token_data["token"])
         return token_data["token"]
 
 def make_auth(installation_id:int)->GithubAuth:
-    r=redis_lib.from_url(settings.redis_url)
+    r=redis.from_url(settings.redis_url)
     return GithubAuth(
         app_id=settings.github_app_id,
         private_key_pem=settings.github_private_key_pem,

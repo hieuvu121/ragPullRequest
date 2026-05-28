@@ -39,6 +39,7 @@ class PRReview(Base):
 	pr_number: Mapped[int] = mapped_column(Integer)
 	status: Mapped[str] = mapped_column(Text, default="pending")  # pending|posted|failed
 	langfuse_trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+	github_review_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 	latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 	raw_output: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 	created_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -49,6 +50,7 @@ class ReviewFeedback(Base):
 
 	id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 	review_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("pr_reviews.id"))
+	comment_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 	action: Mapped[str] = mapped_column(Text)   # "+1" or "-1"
 	value: Mapped[float] = mapped_column(Float)  # 1.0 or 0.0
 	timestamp: Mapped[datetime] = mapped_column(server_default=func.now())
