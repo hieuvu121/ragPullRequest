@@ -1,6 +1,6 @@
 import json
 from fastapi import APIRouter, Request, Response
-from github.events import verify_signature, parse_event
+from gh_app.events import verify_signature, parse_event
 from api.handlers.indexing import handle_push
 from api.handlers.review import handle_pr_opened
 from api.handlers.feedback import handle_review_comment

@@ -5,6 +5,7 @@ from qdrant_client.models import Distance, VectorParams
 from config import settings
 from api.routes.index import router as index_router
 from api.routes.search import router as search_router
+from api.routes.webhook import router as webhook_router
 
 QDRANT_COLLECTIONS = ["code_chunks", "adr_docs", "pr_history"]
 VECTOR_DIM = 1536
@@ -28,6 +29,7 @@ async def lifespan(app:FastAPI):
 app=FastAPI(lifespan=lifespan)
 app.include_router(index_router)
 app.include_router(search_router)
+app.include_router(webhook_router)
 
 @app.get("/healthz")
 def health():

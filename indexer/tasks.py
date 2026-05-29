@@ -24,7 +24,7 @@ def full_index(self,repo_full_name:str, installation_id:int):
 @celery_app.task(name="incremental_index",bind=True,default_retry_delay=60)
 def incremental_index(self, repo_full_name:str, changed_files:list[dict], installation_id:int):
     try:
-        asyncio.run(run_incremental_index(repo_full_name,installation_id))
+        asyncio.run(run_incremental_index(repo_full_name,changed_files,installation_id))
     except Exception as e:
         #time wait for retry increment
         raise self.retry(exc=e,countdown=2**self.request.retries*30)
@@ -111,7 +111,7 @@ async def run_full_index(repo_full_name:str, installation_id:int)->None:
         await index_directory(Path(tmp),repo_id)
 
 async def run_incremental_index(repo_full_name: str, changed_files: list[dict], installation_id: int) -> None:
-    from github.auth import make_auth
+    from gh_app.auth import make_auth
     from github import Github
     from pipeline.chunker import chunk_file
     from pipeline.embedder import Embedder
@@ -180,8 +180,8 @@ def review_pr(self, repo_full_name: str, pr_number: int, installation_id: int):
 async def _run_review(repo_full_name: str, pr_number: int, installation_id: int) -> None:
     import time
     from sqlalchemy import select
-    from github.auth import make_auth
-    from github.client import GithubClient
+    from gh_app.auth import make_auth
+    from gh_app.client import GithubClient
     from scripts.review_pipeline import parse_diff_lines
 
     start = time.monotonic()

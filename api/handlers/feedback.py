@@ -1,4 +1,4 @@
-from github.events import WebhookEvent
+from gh_app.events import WebhookEvent
 from indexer.tasks import record_feedback
 
 

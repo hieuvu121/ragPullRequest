@@ -1,5 +1,5 @@
 from indexer.tasks import review_pr
-from github.events import WebhookEvent
+from gh_app.events import WebhookEvent
 
 def handle_pr_opened(event: WebhookEvent) -> None:
     if event.action != "opened":
