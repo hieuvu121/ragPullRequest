@@ -2,7 +2,7 @@ from indexer.tasks import review_pr
 from gh_app.events import WebhookEvent
 
 def handle_pr_opened(event: WebhookEvent) -> None:
-    if event.action != "opened":
+    if event.action not in ("opened", "reopened"):
         return
     if not event.pr_number or not event.repo_full_name or not event.installation_id:
         return
