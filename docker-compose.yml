@@ -6,6 +6,8 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
+    environment:
+      - PYTHONPATH=/app
     env_file: .env
     depends_on:
       - redis
@@ -17,6 +19,8 @@ services:
     command: celery -A worker:celery_app worker --loglevel=info --concurrency=4
     volumes:
       - .:/app
+    environment:
+      - PYTHONPATH=/app
     env_file: .env
     depends_on:
       - redis
@@ -28,6 +32,8 @@ services:
     command: celery -A worker:celery_app beat --loglevel=info
     volumes:
       - .:/app
+    environment:
+      - PYTHONPATH=/app
     env_file: .env
     depends_on:
       - redis

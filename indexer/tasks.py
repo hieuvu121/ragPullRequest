@@ -22,11 +22,10 @@ def full_index(self,repo_full_name:str, installation_id:int):
         raise self.retry(exc=e,countdown=2**self.request.retries*30)
 
 @celery_app.task(name="incremental_index",bind=True,default_retry_delay=60)
-def incremental_index(self, repo_full_name:str, changed_files:list[dict], installation_id:int):
+def incremental_index(self, repo_full_name:str, installation_id:int, changed_files:list[str]=[], removed_files:list[str]=[]):
     try:
-        asyncio.run(run_incremental_index(repo_full_name,changed_files,installation_id))
+        asyncio.run(run_incremental_index(repo_full_name, installation_id, changed_files, removed_files))
     except Exception as e:
-        #time wait for retry increment
         raise self.retry(exc=e,countdown=2**self.request.retries*30)
 
 #check if hash content changed or not
@@ -110,7 +109,7 @@ async def run_full_index(repo_full_name:str, installation_id:int)->None:
         )
         await index_directory(Path(tmp),repo_id)
 
-async def run_incremental_index(repo_full_name: str, changed_files: list[dict], installation_id: int) -> None:
+async def run_incremental_index(repo_full_name: str, installation_id: int, changed_files: list[str], removed_files: list[str]) -> None:
     from gh_app.auth import make_auth
     from github import Github
     from pipeline.chunker import chunk_file
@@ -125,33 +124,29 @@ async def run_incremental_index(repo_full_name: str, changed_files: list[dict], 
     repo_id = repo_full_name.replace("/", "-")
     embedder = Embedder()
 
-    #equal to create db instance and start a session-> async with will auto close session, dont need to close manually
     async with AsyncSessionLocal() as db:
-        for f in changed_files:
-            path=f["path"]
+        for path in removed_files:
             if not path.endswith(".py"):
                 continue
-            if f["status"]=="removed":
-                await store.delete_by_filter(repo_id,path)
-                await marked_deleted(db,repo_full_name,path)
+            await store.delete_by_filter(repo_id, path)
+            await marked_deleted(db, repo_full_name, path)
+
+        for path in changed_files:
+            if not path.endswith(".py"):
                 continue
             try:
-                #query content and compare with hash
                 content=repo.get_contents(path).decoded_content.decode("utf-8", errors="ignore")
                 new_hash=hashlib.sha256(content.encode()).hexdigest()
                 existing=await get_hash(db,repo_full_name,path)
 
                 if existing==new_hash:
                     continue
-                #chunk files if new and want to add to dtb
+
                 chunks=chunk_file(path,content)
                 if not chunks:
                     continue
 
-                #embed new chunks
                 vectors=await embedder.embed([c.content for c in chunks])
-
-                #delete old chunks
                 await store.delete_by_filter(repo_id,path)
                 points = [
                     PointStruct(

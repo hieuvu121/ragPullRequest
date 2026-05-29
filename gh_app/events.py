@@ -11,6 +11,7 @@ class WebhookEvent:
     installation_id: int | None = None
     repo_full_name: str | None = None
     changed_files: list[str] = field(default_factory=list)
+    removed_files: list[str] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
 #verify if producer is github webhook
@@ -32,11 +33,14 @@ def parse_event(event_type: str, payload: dict) -> WebhookEvent:
     event.repo_full_name = repo.get("full_name")
 
     if event_type == "push":
-        files: set[str] = set()
+        changed: set[str] = set()
+        removed: set[str] = set()
         for commit in payload.get("commits", []):
-            files.update(commit.get("added", []))
-            files.update(commit.get("modified", []))
-        event.changed_files = list(files)
+            changed.update(commit.get("added", []))
+            changed.update(commit.get("modified", []))
+            removed.update(commit.get("removed", []))
+        event.changed_files = list(changed)
+        event.removed_files = list(removed)
 
     if event_type == "pull_request":
         event.pr_number = payload.get("number")

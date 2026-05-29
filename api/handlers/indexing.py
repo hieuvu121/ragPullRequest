@@ -9,4 +9,5 @@ def handle_push(event: WebhookEvent) -> None:
         repo_full_name=event.repo_full_name,
         installation_id=event.installation_id,
         changed_files=event.changed_files,
+        removed_files=event.removed_files,
     )
