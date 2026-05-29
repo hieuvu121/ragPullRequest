@@ -1,5 +1,4 @@
 from github import Github
-from github.InputPullRequestReviewComment import InputPullRequestReviewComment
 
 #responsible for calling github api
 class GithubClient:
@@ -27,15 +26,8 @@ class GithubClient:
     ) -> int:
         repo = self._gh().get_repo(repo_full_name)
         pr = repo.get_pull(pr_number)
-        #convert into format github needed
         gh_comments = [
-            InputPullRequestReviewComment(
-                path=c["path"],
-                position=None,
-                body=c["body"],
-                line=c["line"],
-                side=c.get("side", "RIGHT"),
-            )
+            {"path": c["path"], "line": c["line"], "side": c.get("side", "RIGHT"), "body": c["body"]}
             for c in comments
         ]
         review = pr.create_review(body=summary, event="COMMENT", comments=gh_comments)
