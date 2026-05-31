@@ -4,7 +4,6 @@ from gh_app.events import verify_signature, parse_event
 from api.handlers.indexing import handle_push
 from api.handlers.review import handle_pr_opened
 from api.handlers.feedback import handle_review_comment
-from api.handlers.installation import handle_installation
 from config import settings
 
 router=APIRouter()
@@ -26,8 +25,6 @@ async def github_webhook(request:Request):
         handle_pr_opened(event)
     elif event_type == "pull_request_review_comment":
         handle_review_comment(event)
-    elif event_type in ("installation", "installation_repositories"):
-        handle_installation(event)
     else:
         return Response(status_code=204)
 
