@@ -3,11 +3,12 @@ from gh_app.events import WebhookEvent
 from db.session import AsyncSessionLocal
 from db.models import Repo
 from sqlalchemy import select
+from indexer.tasks import full_index
 import uuid
 
 
 def handle_installation(event: WebhookEvent) -> None:
-    if event.action not in("created","added") or not event.installation_id or not event.repositories:
+    if event.action not in ("created", "added") or not event.installation_id or not event.repositories:
         return
     asyncio.create_task(_insert_repos(event.installation_id, event.repositories))
 
@@ -30,4 +31,5 @@ async def _insert_repos(installation_id: int, repositories: list[dict]) -> None:
                 full_name=full_name,
                 installation_id=installation_id,
             ))
+            full_index.delay(full_name, installation_id)
         await db.commit()
