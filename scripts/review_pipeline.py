@@ -25,6 +25,7 @@ def parse_diff_lines(diff_text:str)->dict[str,set[int]]:
                 if line.is_added and line.target_line_no:
                     added.add(line.target_line_no)
         result[p.path]=added
+    return result
 
 async def main(repo_id:str, diff_text:str)-> None:
     store=QdrantStore()
