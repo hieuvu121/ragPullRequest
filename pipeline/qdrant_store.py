@@ -43,6 +43,14 @@ class QdrantStore:
         )
         return [SearchHit(id=str(h.id),score=h.score,payload=h.payload or{})for h in result.points]
 
+    async def delete_by_repo(self, repo_id: str) -> None:
+        await self.client.delete(
+            collection_name=COLLECTION,
+            points_selector=Filter(must=[
+                FieldCondition(key="repo_id", match=MatchValue(value=repo_id))
+            ])
+        )
+
 #need to pass repo and path id
     async def delete_by_filter(self, repo_id:str, file_path:str)->None:
         await self.client.delete(
