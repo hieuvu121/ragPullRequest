@@ -12,7 +12,6 @@ class WebhookEvent:
     repo_full_name: str | None = None
     changed_files: list[str] = field(default_factory=list)
     removed_files: list[str] = field(default_factory=list)
-    repositories: list[dict] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
 #verify if producer is github webhook
@@ -45,11 +44,5 @@ def parse_event(event_type: str, payload: dict) -> WebhookEvent:
 
     if event_type == "pull_request":
         event.pr_number = payload.get("number")
-
-    if event_type == "installation":
-        event.repositories = payload.get("repositories", [])
-
-    if event_type == "installation_repositories":
-        event.repositories = payload.get("repositories_added", [])
 
     return event
