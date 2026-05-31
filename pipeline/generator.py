@@ -64,13 +64,11 @@ async def generate_review(
         ],
     )
 
-    #create res generator list and return
     raw=json.loads(response.choices[0].message.content)
     comments:list[ReviewComment]=[]
     for c in raw.get("comments",[]):
         path=c.get("path","")
         line=c.get("line",0)
-        #second validation if line in diff dict
         if line not in diff_lines.get(path,set()):
             continue
         comments.append(ReviewComment(
