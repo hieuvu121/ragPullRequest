@@ -94,64 +94,77 @@ git commit -m "chore: add langfuse dependency"
 
 - [ ] **Step 1: Write failing tests**
 
+> **Note on actual signatures (updated from original plan):**
+> - `retrieve` is `async def retrieve(store, query, top_k, candidate_pool)` — no embedder arg, creates its own `AsyncOpenAI` client internally. The `openai_client` symbol does **not** exist at module level; patch `openai.AsyncOpenAI` instead.
+> - `generate_review` is `async def generate_review(diff_text, chunks, diff_lines)` — `diff_lines: dict[str, set[int]]` is a required arg (the line-filter dict). The updated signature must be `generate_review(diff_text, chunks, diff_lines, trace=None)`.
+
 Create `tests/test_tracing.py`:
 ```python
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, AsyncMock, patch
 
 
 def _make_mock_trace():
     trace = MagicMock()
     span = MagicMock()
-    span.__enter__ = MagicMock(return_value=span)
-    span.__exit__ = MagicMock(return_value=False)
     trace.span.return_value = span
     return trace, span
 
 
-def test_retrieve_logs_retrieval_span():
+@pytest.mark.asyncio
+async def test_retrieve_logs_retrieval_span():
     trace, span = _make_mock_trace()
 
     mock_store = MagicMock()
-    mock_store.search.return_value = []
-    mock_embedder = MagicMock()
-    mock_embedder.embed.return_value = [[0.1] * 1536]
+    mock_store.search = AsyncMock(return_value=[])
 
-    with patch("pipeline.retriever.openai_client") as mock_openai:
-        mock_openai.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content="hypothetical snippet"))]
-        )
+    mock_embedding = MagicMock()
+    mock_embedding.data = [MagicMock(embedding=[0.1] * 1536)]
+
+    with patch("openai.AsyncOpenAI") as MockClient:
+        mock_client = AsyncMock()
+        MockClient.return_value = mock_client
+        mock_client.embeddings.create = AsyncMock(return_value=mock_embedding)
+
         from pipeline.retriever import retrieve
-        retrieve("diff content", mock_store, mock_embedder, trace=trace)
+        await retrieve(store=mock_store, query="diff content", top_k=5, trace=trace)
 
     trace.span.assert_any_call(name="retrieval")
 
 
-def test_generate_review_logs_generation_span():
+@pytest.mark.asyncio
+async def test_generate_review_logs_generation_span():
     trace, span = _make_mock_trace()
 
-    with patch("pipeline.generator.openai_client") as mock_openai:
-        mock_openai.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content='[]'))]
-        )
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock(message=MagicMock(content='{"comments": []}'))]
+
+    with patch("openai.AsyncOpenAI") as MockClient:
+        mock_client = AsyncMock()
+        MockClient.return_value = mock_client
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+
         from pipeline.generator import generate_review
-        generate_review("diff", [], trace=trace)
+        await generate_review(diff_text="diff", chunks=[], diff_lines={}, trace=trace)
 
     trace.span.assert_any_call(name="generation")
 
 
-def test_retrieve_works_without_trace():
+@pytest.mark.asyncio
+async def test_retrieve_works_without_trace():
     mock_store = MagicMock()
-    mock_store.search.return_value = []
-    mock_embedder = MagicMock()
-    mock_embedder.embed.return_value = [[0.1] * 1536]
+    mock_store.search = AsyncMock(return_value=[])
 
-    with patch("pipeline.retriever.openai_client") as mock_openai:
-        mock_openai.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content="hypothetical"))]
-        )
+    mock_embedding = MagicMock()
+    mock_embedding.data = [MagicMock(embedding=[0.1] * 1536)]
+
+    with patch("openai.AsyncOpenAI") as MockClient:
+        mock_client = AsyncMock()
+        MockClient.return_value = mock_client
+        mock_client.embeddings.create = AsyncMock(return_value=mock_embedding)
+
         from pipeline.retriever import retrieve
-        result = retrieve("diff", mock_store, mock_embedder, trace=None)
+        result = await retrieve(store=mock_store, query="diff", top_k=5, trace=None)
 
     assert isinstance(result, list)
 ```
@@ -162,81 +175,120 @@ def test_retrieve_works_without_trace():
 pytest tests/test_tracing.py -v
 ```
 
-Expected: FAIL — `retrieve` does not accept a `trace` argument yet.
+Expected: FAIL — `retrieve` and `generate_review` do not accept a `trace` argument yet.
 
 - [ ] **Step 3: Modify `pipeline/retriever.py` to accept and use `trace`**
 
-Add `trace=None` parameter and span logging. Wrap the retrieval + reranking block:
+Add `trace=None` to the existing `async def retrieve(store, query, top_k, candidate_pool)` signature and wrap the search + RRF merge in spans:
 
 ```python
-# In retrieve(), after existing imports, add typing import:
 from typing import Any
 
-# Change the function signature:
-def retrieve(
-    diff: str,
-    store: "QdrantStore",
-    embedder: "Embedder",
+async def retrieve(
+    store: QdrantStore,
+    query: str,
+    top_k: int = 5,
+    candidate_pool: int = 20,
     trace: Any = None,
-) -> list["Chunk"]:
-    # --- HyDE expansion (unchanged) ---
-    hyde_snippet = _hyde_expand(diff)
-    hyde_vec = embedder.embed([hyde_snippet])[0]
-    diff_vec = embedder.embed([diff])[0]
-    query_vec = [(h + d) / 2 for h, d in zip(hyde_vec, diff_vec)]
+) -> list[ScoredChunk]:
+    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    stripped = _strip_diff_markers(query)
 
-    # --- Retrieval span ---
+    original_vector, stripped_vector = await asyncio.gather(
+        _embed_one(client, query),
+        _embed_one(client, stripped),
+    )
+
     if trace:
         span = trace.span(name="retrieval")
-        span.update(input={"diff_length": len(diff)})
+        span.update(input={"query_len": len(query), "candidate_pool": candidate_pool})
 
-    results = store.search(query_vec, limit=20)
+    original_hits, stripped_hits = await asyncio.gather(
+        store.search(original_vector, limit=candidate_pool),
+        store.search(stripped_vector, limit=candidate_pool),
+    )
 
     if trace:
-        span.update(output={"num_candidates": len(results)})
+        span.update(output={"num_candidates": len(original_hits) + len(stripped_hits)})
         span.end()
 
-    # --- Reranking span ---
+    id_to_hit = {}
+    for hit in original_hits + stripped_hits:
+        id_to_hit[hit.id] = hit
+
     if trace:
         rerank_span = trace.span(name="reranking")
 
-    reranked = _rerank(diff, results)
+    merged = reciprocal_rank_fusion(
+        [[h.id for h in original_hits], [h.id for h in stripped_hits]]
+    )
+    candidates = [
+        ScoredChunk(id=doc_id, score=score, payload=id_to_hit[doc_id].payload)
+        for doc_id, score in merged
+        if doc_id in id_to_hit
+    ]
 
     if trace:
-        rerank_span.update(output={"num_kept": len(reranked)})
+        rerank_span.update(output={"num_kept": len(candidates[:top_k])})
         rerank_span.end()
 
-    return reranked
+    return candidates[:top_k]
 ```
 
 - [ ] **Step 4: Modify `pipeline/generator.py` to accept and use `trace`**
 
+Add `trace=None` to the existing `async def generate_review(diff_text, chunks, diff_lines)` signature — keep `diff_lines` as it is required for the line-filter:
+
 ```python
 from typing import Any
 
-def generate_review(
-    diff: str,
-    chunks: list["Chunk"],
+async def generate_review(
+    diff_text: str,
+    chunks: list[ScoredChunk],
+    diff_lines: dict[str, set[int]],
     trace: Any = None,
 ) -> list[ReviewComment]:
-    prompt = _build_prompt(diff, chunks)
+    context_text = "\n\n".join(
+        f"### {c.payload.get('file_path', '')}:"
+        f"{c.payload.get('start_line', 0)}-{c.payload.get('end_line', 0)}\n"
+        f"{c.payload.get('content', '')}"
+        for c in chunks
+    )
+    user_message = f"## Diff\n{diff_text}\n\n## Context Chunks\n{context_text}"
 
     if trace:
         gen_span = trace.span(name="generation")
-        gen_span.update(input={"prompt_chars": len(prompt)})
+        gen_span.update(input={"prompt_chars": len(user_message)})
 
-    response = openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
+    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    response = await client.chat.completions.create(
+        model=GENERATION_MODEL,
         response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
     )
-    raw = response.choices[0].message.content
+    raw = json.loads(response.choices[0].message.content)
 
     if trace:
-        gen_span.update(output={"response_chars": len(raw)})
+        gen_span.update(output={"raw_comment_count": len(raw.get("comments", []))})
         gen_span.end()
 
-    return _parse_comments(raw, diff)
+    comments: list[ReviewComment] = []
+    for c in raw.get("comments", []):
+        path = c.get("path", "")
+        line = c.get("line", 0)
+        if line not in diff_lines.get(path, set()):
+            continue
+        comments.append(ReviewComment(
+            line=line, path=path,
+            severity=c.get("severity", "suggestion"),
+            issue=c.get("issue", ""),
+            suggestion=c.get("suggestion", ""),
+            citation=c.get("citation", ""),
+        ))
+    return comments
 ```
 
 - [ ] **Step 5: Run tests**
@@ -260,33 +312,41 @@ git commit -m "feat: langfuse retrieval and generation spans in pipeline"
 
 **Files:**
 - Modify: `indexer/tasks.py`
-- Modify: `db/models.py`
 
-- [ ] **Step 1: Add `langfuse_trace_id` column to `PRReview`**
+> **Note:** `db/models.py` already has `langfuse_trace_id: Mapped[str | None]` on `PRReview` (added during Phase 3). Skip the model change and only run the migration if the column is missing from the live DB. Check with:
+> ```bash
+> docker compose exec postgres psql -U rag -d rag -c "\d pr_reviews"
+> ```
+> If `langfuse_trace_id` is absent, generate and apply a migration; otherwise skip Step 1 and Step 2.
 
-In `db/models.py`, add to the `PRReview` class:
-```python
-langfuse_trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
-```
+- [ ] **Step 1 (conditional): Generate and apply migration**
 
-- [ ] **Step 2: Generate and apply migration**
-
+Only run this if `langfuse_trace_id` is not yet in the DB:
 ```bash
 alembic revision --autogenerate -m "add_langfuse_trace_id_to_pr_reviews"
 alembic upgrade head
 ```
 
-Verify the migration file in `alembic/versions/` added `langfuse_trace_id` column.
+- [ ] **Step 2: Modify `_run_review` in `indexer/tasks.py` to create a trace**
 
-- [ ] **Step 3: Modify `_run_review` in `indexer/tasks.py` to create a trace**
+> **Note on actual code (updated from original plan):**
+> - `QdrantStore()` takes no constructor arguments — it reads `QDRANT_URL` from env internally. Do not pass `url=`.
+> - `retrieve()` and `generate_review()` are both `async`, so they need `await`.
+> - `generate_review()` requires `diff_lines` as a positional argument — pass the result of `parse_diff_lines(diff)`.
+> - The existing `_run_review` already imports `parse_diff_lines` and builds `diff_lines`; add the Langfuse trace around the existing calls rather than rewriting from scratch.
 
-Replace the trace section inside `_run_review`:
+Patch `_run_review` to add a Langfuse trace — add these imports at the top of `tasks.py` and update `_run_review`:
 ```python
 from config import settings
 from langfuse import Langfuse
 
-async def _run_review(repo_full_name: str, pr_number: int, installation_id: int):
+async def _run_review(repo_full_name: str, pr_number: int, installation_id: int) -> None:
     import time
+    from sqlalchemy import select
+    from gh_app.auth import make_auth
+    from gh_app.client import GithubClient
+    from scripts.review_pipeline import parse_diff_lines
+
     start = time.monotonic()
 
     lf = Langfuse(
@@ -303,29 +363,29 @@ async def _run_review(repo_full_name: str, pr_number: int, installation_id: int)
     client = GithubClient(token=token)
     diff = client.get_diff(repo_full_name, pr_number)
 
-    store = QdrantStore(url=settings.qdrant_url)
-    embedder = Embedder()
+    store = make_store()  # QdrantStore() — no url arg
 
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(models.Repo).where(models.Repo.full_name == repo_full_name)
-        )
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Repo).where(Repo.full_name == repo_full_name))
         db_repo = result.scalar_one_or_none()
         if not db_repo:
             return
 
-        pr_review = models.PRReview(
+        pr_review = PRReview(
             repo_id=db_repo.id,
             pr_number=pr_number,
             status="pending",
             langfuse_trace_id=trace.id,
         )
-        session.add(pr_review)
-        await session.flush()
+        db.add(pr_review)
+        await db.flush()
 
         try:
-            chunks = retrieve(diff, store, embedder, trace=trace)
-            comments = generate_review(diff, chunks, trace=trace)
+            diff_lines = parse_diff_lines(diff)
+            chunks = await retrieve(store=store, query=diff, top_k=5, trace=trace)
+            comments = await generate_review(
+                diff_text=diff, chunks=chunks, diff_lines=diff_lines, trace=trace
+            )
 
             gh_comments = [
                 {
@@ -337,18 +397,19 @@ async def _run_review(repo_full_name: str, pr_number: int, installation_id: int)
                 for c in comments
             ]
             summary = f"AI review for PR #{pr_number} — {len(comments)} comment(s) generated."
-
-            raw_output = [c.__dict__ for c in comments]
-            review_id = client.post_review(repo_full_name, pr_number, summary, gh_comments)
+            github_review_id = client.post_review(repo_full_name, pr_number, summary, gh_comments)
 
             pr_review.status = "posted"
-            pr_review.github_review_id = review_id
-            pr_review.raw_output = raw_output
+            pr_review.github_review_id = github_review_id
             pr_review.latency_ms = int((time.monotonic() - start) * 1000)
-
-            trace.update(
-                output={"comments": len(comments), "latency_ms": pr_review.latency_ms}
-            )
+            pr_review.raw_output = {
+                "comments": [
+                    {"line": c.line, "path": c.path, "severity": c.severity,
+                     "issue": c.issue, "suggestion": c.suggestion, "citation": c.citation}
+                    for c in comments
+                ]
+            }
+            trace.update(output={"comments": len(comments), "latency_ms": pr_review.latency_ms})
         except Exception:
             pr_review.status = "failed"
             trace.update(metadata={"error": True})
@@ -356,13 +417,13 @@ async def _run_review(repo_full_name: str, pr_number: int, installation_id: int)
         finally:
             lf.flush()
 
-        await session.commit()
+        await db.commit()
 ```
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add db/models.py alembic/versions/ indexer/tasks.py
+git add alembic/versions/ indexer/tasks.py
 git commit -m "feat: langfuse trace per review_pr with trace_id persisted to postgres"
 ```
 
@@ -483,7 +544,7 @@ async def _run_feedback(comment_id: int, action: str, raw: dict):
             return
 
         session.add(models.ReviewFeedback(
-            pr_review_id=pr_review.id,
+            review_id=pr_review.id,  # field is review_id, not pr_review_id
             comment_id=comment_id,
             action=action,
             value=value,
@@ -530,6 +591,8 @@ services:
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000
     restart: always
     env_file: .env.prod
+    environment:
+      - PYTHONPATH=/app
     ports:
       - "8000:8000"
     depends_on:
@@ -542,6 +605,8 @@ services:
     command: celery -A worker.celery_app worker --loglevel=info --concurrency=4
     restart: always
     env_file: .env.prod
+    environment:
+      - PYTHONPATH=/app
     depends_on:
       - redis
       - postgres
@@ -552,6 +617,8 @@ services:
     command: celery -A worker.celery_app beat --loglevel=info
     restart: always
     env_file: .env.prod
+    environment:
+      - PYTHONPATH=/app
     depends_on:
       - redis
 

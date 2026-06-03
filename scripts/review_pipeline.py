@@ -22,7 +22,7 @@ def parse_diff_lines(diff_text:str)->dict[str,set[int]]:
         #each hunk is a block of changes
         for hunk in p:
             for line in hunk:
-                if line.is_added and line.target_line_no:
+                if (line.is_added or line.is_context) and line.target_line_no:
                     added.add(line.target_line_no)
         result[p.path]=added
     return result
